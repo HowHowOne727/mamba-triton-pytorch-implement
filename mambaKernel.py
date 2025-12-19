@@ -6,10 +6,10 @@ import triton.language as tl
 @triton.jit
 def mamba_fusion_ssm_kernel(
         delta, A, B, C, x, y, h, h_out,   # ptrs
-        Batch_size, length, d_model, checkpoint,   # ints
+        Batch_size, length, d_model, checkpoint, groups,   # ints
         delta_stride_B, delta_stride_L, delta_stride_D,
         A_stride_D, A_stride_N,
-        B_stride_D, B_stride_N,
+        B_stride_B, B_stride_L, B_stride_G, B_stride_N,
         C_stride_D, C_stride_N,
         x_stride_B, x_stride_L, x_stride_D,
         y_stride_B, y_stride_L, y_stride_D,
@@ -22,7 +22,7 @@ def mamba_fusion_ssm_kernel(
     
     :param delta: (B , L , D)
     :param A: (D , N)
-    :param B: (D , N)
+    :param B: (D , L , G , N)
     :param C: (D , N)
     :param x: (B , L , D)
     :param y: (B , L , D)
@@ -32,69 +32,56 @@ def mamba_fusion_ssm_kernel(
     pid_B = tl.program_id(0)
     pid_D = tl.program_id(1)
 
-    # load delta
-    offs_delta_batch = pid_B + tl.arange(0 , 1)
-    offs_delta_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
+    offs_B = pid_B + tl.arange(0 , 1)
+    offs_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
+    offs_N = tl.arange(0 , n_state)
 
-    delta_ptr = delta + (offs_delta_batch[: , None] * delta_stride_B \
-                         + offs_delta_D[None , :] * delta_stride_D)
+    # load delta
+    delta_ptr = delta + (offs_B[: , None] * delta_stride_B \
+                         + offs_D[None , :] * delta_stride_D)
 
     # load hidden
-    offs_h_batch = pid_B + tl.arange(0 , 1)
-    offs_h_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-    offs_h_N = tl.arange(0 , n_state)
-
-    h0_ptr = h + (offs_h_batch[: , None , None] * h_stride_B\
-                   + offs_h_D[None , : , None] * h_stride_D\
-                   + offs_h_N[None , None , :] * h_stride_N)
+    h0_ptr = h + (offs_B[: , None , None] * h_stride_B\
+                   + offs_D[None , : , None] * h_stride_D\
+                   + offs_N[None , None , :] * h_stride_N)
     
-    h_ptr = h + (offs_h_batch[: , None , None , None] * h_stride_B\
-                   + offs_h_D[None , None , : , None] * h_stride_D\
-                   + offs_h_N[None , None , None , :] * h_stride_N)
+    h_ptr = h + (offs_B[: , None , None , None] * h_stride_B\
+                   + offs_D[None , None , : , None] * h_stride_D\
+                   + offs_N[None , None , None , :] * h_stride_N)
     
     hidden_tile: tl.tensor = tl.load(h0_ptr)     # (B , D , N)
 
     # load A
-    offs_A_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-    offs_A_N = tl.arange(0 , n_state)
-    A_ptr = A + (offs_A_D[: , None] * A_stride_D + offs_A_N[None , :] * A_stride_N)
+    A_ptr = A + (offs_D[: , None] * A_stride_D + offs_N[None , :] * A_stride_N)
     A_tile: tl.tensor = tl.load(A_ptr)    # (D , N)
 
-    # load B
-    offs_B_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-    offs_B_N = tl.arange(0 , n_state)
-    B_ptr = B + (offs_B_D[: , None] * B_stride_D + offs_B_N[None , :] * B_stride_N)
-    B_tile: tl.tensor = tl.load(B_ptr)    # (D , N)
+    # set B ptr
+    B_group_id = (pid_D * BLOCK_SIZE_D) // (d_model // groups)
+    B_ptr = B + B_group_id * B_stride_G + (offs_B[: , None , None] * B_stride_B + offs_N[None , None , :] * B_stride_N)   # (B , G , N)
 
     # load C
-    offs_C_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-    offs_C_N = tl.arange(0 , n_state)
-    C_ptr = C + (offs_C_D[: , None] * C_stride_D + offs_C_N[None , :] * C_stride_N)
+    C_ptr = C + (offs_D[: , None] * C_stride_D + offs_N[None , :] * C_stride_N)
     C_tile: tl.tensor = tl.load(C_ptr)    # (D , N)
 
     # load x
-    offs_x_B = pid_B + tl.arange(0 , 1)
-    offs_x_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-
-    x_ptr = x + (offs_x_B[: , None] * x_stride_B\
-                 + offs_x_D[ None , :] * x_stride_D)
+    x_ptr = x + (offs_B[: , None] * x_stride_B\
+                 + offs_D[ None , :] * x_stride_D)
     
     # y
-    offs_y_B = pid_B + tl.arange(0 , 1)
     offs_y_L = tl.arange(0 , 1)
-    offs_y_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
 
-    y_ptr = y + (offs_y_B[: , None , None] * y_stride_B\
+    y_ptr = y + (offs_B[: , None , None] * y_stride_B\
                  + offs_y_L[None , : , None] * y_stride_L\
-                 + offs_y_D[None , None , :] * y_stride_D)
+                 + offs_D[None , None , :] * y_stride_D)
 
     for steps in range(0, length):     # main loop
         x_tile: tl.tensor = tl.load(x_ptr + steps * x_stride_L)  # (B , D)
         delta_t: tl.tensor = tl.load(delta_ptr + steps * delta_stride_L) # (B , D)
+        B_tile = tl.load(B_ptr + steps * B_stride_L)    # (B , D , N)
 
         temp = delta_t[: , : , None] * A_tile[None , : , :]   # (B , D , N)
         A_hat = tl.exp(temp)     # (B , D , N)
-        B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_t[: , : , None] * B_tile[None , : , :])  # (B , D , N)
+        B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_t[: , : , None] * B_tile)  # (B , D , N)
 
         hidden_next = A_hat * hidden_tile + B_hat * x_tile[: , : , None]
 
@@ -108,13 +95,10 @@ def mamba_fusion_ssm_kernel(
         tl.store(y_ptr + steps * y_stride_L , _out[: , None , :])
 
     # save h_out
-    offs_h_out_batch = pid_B + tl.arange(0 , 1)
-    offs_h_out_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
-    offs_h_out_N = tl.arange(0 , n_state)
 
-    h_out_ptr = h_out + (offs_h_out_batch[: , None , None] * h_out_stride_B\
-                         + offs_h_out_D[None , : , None] * h_out_stride_D\
-                         + offs_h_out_N[None , None , :] * h_out_stride_N)
+    h_out_ptr = h_out + (offs_B[: , None , None] * h_out_stride_B\
+                         + offs_D[None , : , None] * h_out_stride_D\
+                         + offs_N[None , None , :] * h_out_stride_N)
     tl.store(h_out_ptr , hidden_tile)
 
 @triton.jit
