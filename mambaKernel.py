@@ -108,10 +108,10 @@ def mamba_fusion_ssm_backward_kernel(
         g_delta, g_A, g_B, g_C, g_x, g_h0,  # gradients to store
         g_y, g_h_out,           # upstream gradients
 
-        Batch_size, Length, d_model,
+        Batch_size, Length, d_model, groups,
         delta_stride_B, delta_stride_L, delta_stride_D,
         A_stride_D, A_stride_N,
-        B_stride_D, B_stride_N,
+        B_stride_B, B_stride_L, B_stride_G, B_stride_N,
         C_stride_D, C_stride_N,
         x_stride_B, x_stride_L, x_stride_D,
         h_cp_stride_B, h_cp_stride_L, h_cp_stride_D, h_cp_stride_N,
@@ -128,17 +128,18 @@ def mamba_fusion_ssm_backward_kernel(
     offs_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
     offs_N = tl.arange(0 , n_states)
 
-    # load A, B, C
+    # load A, C
     A_ptr = A + (offs_D[: , None] * A_stride_D + offs_N[None , :] * A_stride_N)
-    B_ptr = B + (offs_D[: , None] * B_stride_D + offs_N[None , :] * B_stride_N)
     C_ptr = C + (offs_D[: , None] * C_stride_D + offs_N[None , :] * C_stride_N)
 
+    B_groups_id = (pid_D * BLOCK_SIZE_D) // (d_model // groups)
+    B_ptr = B + B_groups_id * B_stride_G + (offs_B[: , None , None] * B_stride_B + offs_N[None , None , :] * B_stride_N)    # (B , G , N)
+    g_B_ptr = g_B + B_groups_id * B_stride_G + (offs_B[: , None , None] * B_stride_B + offs_N[None , None , :] * B_stride_N)
+
     A_tile = tl.load(A_ptr)
-    B_tile = tl.load(B_ptr)
     C_tile = tl.load(C_ptr)
 
     g_A_tile = tl.zeros_like(A_tile[None , : , :])
-    g_B_tile = tl.zeros_like(B_tile[None , : , :])
     g_C_tile = tl.zeros_like(C_tile[None , : , :])
 
     # pre-calculate pointers
@@ -168,13 +169,14 @@ def mamba_fusion_ssm_backward_kernel(
         for i in range(checkpoints - 1):
             idx = i + block_id * checkpoints
             if (idx < Length):     # range check
-                # load x and delta
+                # load x, delta, B
                 x_tile: tl.tensor = tl.load(x_ptr + idx * x_stride_L)  # (B , D)
                 delta_tile: tl.tensor = tl.load(delta_ptr + idx * delta_stride_L)  # (B , D)
+                B_tile = tl.load(B_ptr + idx * B_stride_L)      # (B , D , N)
 
                 temp = delta_tile[: , : , None] * A_tile[None , : , :]  # (B , D , N)
                 A_hat = tl.exp(temp)    # (B , D , N)
-                B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_tile[: , : , None] * B_tile[None , : , :])   # (B , D , N)
+                B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_tile[: , : , None] * B_tile)   # (B , D , N)
 
                 hidden_curr = A_hat * hidden_curr + B_hat * x_tile[: , : , None]
 
@@ -187,45 +189,45 @@ def mamba_fusion_ssm_backward_kernel(
                 _mask = h_block_arange_dim == i
                 h_curr = tl.sum(tl.where(_mask , h_block , 0.0) , axis=1)
 
-                g_y_tile = tl.load(g_y_ptr + idx * g_y_stride_L)    # (B , D)
-                x_tile = tl.load(x_ptr + idx * x_stride_L)      # (B , D)
-                delta_tile = tl.load(delta_ptr + idx * delta_stride_L)  # (B , D)
+                # loads
+                g_y_tile = tl.load(g_y_ptr + idx * g_y_stride_L)                        # (B , D)
+                x_tile = tl.load(x_ptr + idx * x_stride_L)                              # (B , D)
+                delta_tile = tl.load(delta_ptr + idx * delta_stride_L)[: , : , None]    # (B , D , 1)
+                B_tile = tl.load(B_ptr + idx * B_stride_L)                              # (B , D , N)
                 
-                temp = delta_tile[: , : , None] * A_tile[None , : , :]  # (B , D , N)   # delta*A
+                temp = delta_tile * A_tile[None , : , :]                  # (B , D , N)   # delta*A
                 A_hat = tl.exp(temp)    # (B , D , N)
                 _expTempm1sA = (A_hat - 1.0) / A_tile[None , : , :]
-                B_hat = _expTempm1sA * (delta_tile[: , : , None] * B_tile[None , : , :])   # (B , D , N)
+                B_hat = _expTempm1sA * (delta_tile * B_tile)              # (B , D , N)
 
                 g_C_tile += g_y_tile[: , : , None] * h_curr      # C gradient
                 g_A_hat = g_h_tile * h_curr
                 g_B_hat = g_h_tile * x_tile[: , : , None]
 
                 _g_temp = g_A_hat * A_hat
-                _g_temp += g_B_hat * A_hat / A_tile[None , : , :] * delta_tile[: , : , None] * B_tile[None , : , :]      # dB_hat * exp(temp)/A * delta * B
-                g_A_tile += g_B_hat * (-(tl.exp(temp) - 1) * delta_tile[: , : , None] * B_tile[None , : , :] / (A_tile[None , : , :]*A_tile[None , : , :]))  # dA = dB_hat * (-(exp(temp)-1)*delta*B / A^2)
-                _g_delta = g_B_hat * _expTempm1sA * B_tile[None , : , :]
-                g_B_tile += g_B_hat * _expTempm1sA * delta_tile[: , : , None]   # dB = dB_hat * (exp(temp) - 1) / A * delta
+                _g_temp += g_B_hat * A_hat / A_tile[None , : , :] * delta_tile * B_tile      # dB_hat * exp(temp)/A * delta * B
+                g_A_tile += g_B_hat * (-(tl.exp(temp) - 1) * delta_tile * B_tile / (A_tile[None , : , :]*A_tile[None , : , :]))  # dA = dB_hat * (-(exp(temp)-1)*delta*B / A^2)
+                _g_delta = g_B_hat * _expTempm1sA * B_tile
+                g_B_tile = g_B_hat * _expTempm1sA * delta_tile   # dB = dB_hat * (exp(temp) - 1) / A * delta
                 _g_delta += _g_temp * A_tile[None , : , :]
-                g_A_tile += _g_temp * delta_tile[: , : , None]
+                g_A_tile += _g_temp * delta_tile
 
                 _g_x = g_h_tile * B_hat
 
                 g_h_tile = g_h_tile * A_hat + g_y_tile[: , : , None] * C_tile[None , : , :]  # h_t gradient, updata g_h_tile
 
-                tl.store(g_x_ptr + idx * x_stride_L , tl.sum(_g_x , axis=-1))             # save x gradient
-                tl.store(g_delta_ptr + idx * delta_stride_L , tl.sum(_g_delta , axis=-1)) # save delta gradient
+                tl.store(g_x_ptr + idx * x_stride_L , tl.sum(_g_x , axis=-1))               # save x gradient
+                tl.store(g_delta_ptr + idx * delta_stride_L , tl.sum(_g_delta , axis=-1))   # save delta gradient
+                tl.atomic_add(g_B_ptr + idx * B_stride_L, tl.sum(g_B_tile, axis=1, keep_dims=True) / (d_model // groups // BLOCK_SIZE_D))     # save B_t gradient
     
-    # save A, B, C, h0 gradient
+    # save A, C, h0 gradient
     g_A_tile = tl.sum(g_A_tile , axis=0)    # (B , D , N) to (D , N)
-    g_B_tile = tl.sum(g_B_tile , axis=0)
     g_C_tile = tl.sum(g_C_tile , axis=0)
 
     g_A_ptr = g_A + (offs_D[: , None] * A_stride_D + offs_N[None , :] * A_stride_N)
-    g_B_ptr = g_B + (offs_D[: , None] * B_stride_D + offs_N[None , :] * B_stride_N)
     g_C_ptr = g_C + (offs_D[: , None] * C_stride_D + offs_N[None , :] * C_stride_N)
 
     tl.atomic_add(g_A_ptr , g_A_tile)
-    tl.atomic_add(g_B_ptr , g_B_tile)
     tl.atomic_add(g_C_ptr , g_C_tile)
 
     g_h0_ptr = g_h0 + (offs_B[: , None , None] * g_h0_stride_B + offs_D[None , : , None] * g_h0_stride_D + offs_N[None , None , :] * g_h0_stride_N)
@@ -258,9 +260,13 @@ class MambaFusionSSMFunction(torch.autograd.Function):
         h0: torch.Tensor,
         checkpoint_len:int
     ):
-        BLOCK_SIZE_D = 16
+        BLOCK_SIZE_D = 32
         Batch_size , Length , D_model = delta.shape
+        groups = B.size(2)
         n_state = A.size(-1)
+
+        if (D_model // groups < BLOCK_SIZE_D):  # limit BLOCK_SIZE_D
+            BLOCK_SIZE_D = D_model // groups
 
         h_checkpoint = torch.zeros(size=(Batch_size , (Length // checkpoint_len) + 1 , D_model , n_state) , dtype=x.dtype , device=x.device)
         h_checkpoint[: , 0 , : , :] = h0
@@ -273,10 +279,10 @@ class MambaFusionSSMFunction(torch.autograd.Function):
 
         grid = (Batch_size , triton.cdiv(D_model , BLOCK_SIZE_D))
         mamba_fusion_ssm_kernel[grid](delta, A, B, C, x, y, h_checkpoint, h_out,
-                                    Batch_size, Length, D_model, checkpoint_len,
+                                    Batch_size, Length, D_model, checkpoint_len, groups,
                                     delta.stride(0), delta.stride(1), delta.stride(2),
                                     A.stride(0) , A.stride(1),
-                                    B.stride(0), B.stride(1),
+                                    B.stride(0), B.stride(1), B.stride(2), B.stride(3),
                                     C.stride(0), C.stride(1),
                                     x.stride(0), x.stride(1), x.stride(2),
                                     y.stride(0), y.stride(1), y.stride(2),
@@ -299,7 +305,11 @@ class MambaFusionSSMFunction(torch.autograd.Function):
 
         BLOCK_SIZE_D = 4
         Batch_size, Length, D_model = delta.shape
+        groups = B.size(2)
         n_state = A.size(-1)
+        
+        if (D_model // groups < BLOCK_SIZE_D):  # limit BLOCK_SIZE_D
+            BLOCK_SIZE_D = D_model // groups
 
         g_delta = torch.zeros_like(delta)
         g_A = torch.zeros_like(A)
@@ -313,10 +323,10 @@ class MambaFusionSSMFunction(torch.autograd.Function):
             delta, A, B, C, x, h_checkpoint,
             g_delta, g_A, g_B, g_C, g_x, g_h0,
             grad_y, grad_h_out,
-            Batch_size, Length, D_model,
+            Batch_size, Length, D_model, groups,
             delta.stride(0), delta.stride(1), delta.stride(2),
             A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
             C.stride(0), C.stride(1),
             x.stride(0), x.stride(1), x.stride(2),
             h_checkpoint.stride(0), h_checkpoint.stride(1), h_checkpoint.stride(2), h_checkpoint.stride(3),
