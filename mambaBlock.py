@@ -7,7 +7,6 @@ from mambaKernel import mamba_fusion_ssm
 @dataclass
 class ModelConfig:
     d_model: int
-    num_B_groups: int
     n_states: int
     conv_kernel: int
     n_layers: int
@@ -29,34 +28,31 @@ class MambaBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        self.in_proj = nn.Linear(config.d_model , 2 * config.d_model)
-
-        self.delta_proj = nn.Linear(config.d_model , config.d_model , bias=False)
+        self.in_proj = nn.Linear(config.d_model , (config.d_model + config.d_model + config.n_states + 1))   # n_states for B, 1 for delta
         
         A_init = torch.arange(1 , config.n_states + 1 , 1 , dtype=torch.float32).repeat(config.d_model , 1).contiguous()
         self.A_log_param = nn.Parameter(torch.log(A_init))
-        self.B_proj = nn.Linear(config.d_model , config.num_B_groups * config.n_states)
-        self.C_param = nn.Parameter(torch.randn(config.d_model , config.n_states) * 0.02)
+        self.B_param = nn.Parameter(torch.randn(config.n_states) / config.n_states**0.5)    # (N)
+        self.C_param = nn.Parameter(torch.randn(config.d_model , config.n_states) / config.n_states**0.5)   # (D , N)
 
         self.conv = CausalConv1d(config.d_model , config.conv_kernel , config.d_model)
 
         nn.init.normal_(self.in_proj.weight, 0, 0.02)
-        nn.init.normal_(self.B_proj.weight , 0 , 0.0001)
-        nn.init.uniform_(self.delta_proj.weight, 0.001, 0.1)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # input : (B , L , D)
         BATCH_SIZE , LENGTH , _ = input.shape
-        x_proj = self.in_proj.forward(input)    # (B , L , 2*D)
+        x_proj = self.in_proj.forward(input)
 
-        u , v = torch.split(x_proj , [self.config.d_model , self.config.d_model] , dim=-1)
+        v , x , B , delta = torch.split(x_proj , [self.config.d_model , self.config.d_model , self.config.n_states , 1] , dim=-1)
 
-        delta = F.softplus(self.delta_proj.forward(u))  # (B , L , D)
+        delta = F.softplus(delta).squeeze(-1)  # (B , L , 1) to (B , L)
+        delta = delta * F.sigmoid(delta)
         A = -torch.exp(self.A_log_param)
-        B = self.B_proj.forward(u).view(BATCH_SIZE , LENGTH , self.config.num_B_groups , self.config.n_states)
-        u = F.silu(self.conv.forward(u))
+        B = (B + self.B_param[None , None , :])
+        x = self.conv.forward(F.silu(x))
         
-        y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param , u)
+        y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param , x)
 
         out = y * F.silu(v)     # (B , L , D)
         return out
