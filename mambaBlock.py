@@ -1,22 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from mambaKernel import mamba_fusion_ssm
+from ssm_kernel import mamba_fusion_ssm
 
-@dataclass
-class ModelConfig:
-    d_model: int
-    n_states: int
-    conv_kernel: int
-    n_layers: int
-    vocab_size: int
 
 class CausalConv1d(nn.Module):
     def __init__(self, d_model: int, kernel_size: int, num_group: int):
         super().__init__()
         self.kernel_size: int = kernel_size
-        self.conv = nn.Conv1d(d_model , d_model , kernel_size , 1 , kernel_size - 1 , groups=num_group)
+        self.conv = nn.Conv1d(d_model , d_model , kernel_size , 1 , kernel_size - 1 , groups=num_group , bias=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x : (B , L , D)
         x = x.transpose(1 , 2)  # (B , D , L)
@@ -24,27 +16,28 @@ class CausalConv1d(nn.Module):
         return x.contiguous()
 
 class MambaBlock(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, d_model: int, n_states: int, conv_kernel_size: int):
         super().__init__()
-        self.config = config
+        self.d_model = d_model
+        self.n_states = n_states
+        self.conv_kernel_size = conv_kernel_size
 
-        self.in_proj = nn.Linear(config.d_model , (config.d_model + config.d_model + config.n_states + 1))   # n_states for B, 1 for delta
+        self.in_proj = nn.Linear(self.d_model , (self.d_model + self.d_model + self.n_states + 1))   # n_states for B, 1 for delta
         
-        A_init = torch.arange(1 , config.n_states + 1 , 1 , dtype=torch.float32).repeat(config.d_model , 1).contiguous()
+        A_init = torch.arange(1 , self.n_states + 1 , 1 , dtype=torch.float32).repeat(self.d_model , 1).contiguous()
         self.A_log_param = nn.Parameter(torch.log(A_init))
-        self.B_param = nn.Parameter(torch.randn(config.n_states) / config.n_states**0.5)    # (N)
-        self.C_param = nn.Parameter(torch.randn(config.d_model , config.n_states) / config.n_states**0.5)   # (D , N)
+        self.B_param = nn.Parameter(torch.randn(self.n_states) / self.n_states**0.5)    # (N)
+        self.C_param = nn.Parameter(torch.randn(self.d_model , self.n_states) / self.n_states**0.5)   # (D , N)
 
-        self.conv = CausalConv1d(config.d_model , config.conv_kernel , config.d_model)
+        self.conv = CausalConv1d(self.d_model , self.conv_kernel_size , self.d_model)
 
         nn.init.normal_(self.in_proj.weight, 0, 0.02)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # input : (B , L , D)
-        BATCH_SIZE , LENGTH , _ = input.shape
         x_proj = self.in_proj.forward(input)
 
-        v , x , B , delta = torch.split(x_proj , [self.config.d_model , self.config.d_model , self.config.n_states , 1] , dim=-1)
+        v , x , B , delta = torch.split(x_proj , [self.d_model , self.d_model , self.n_states , 1] , dim=-1)
 
         delta = F.softplus(delta).squeeze(-1)  # (B , L , 1) to (B , L)
         delta = delta * F.sigmoid(delta)
@@ -53,34 +46,24 @@ class MambaBlock(nn.Module):
         x = self.conv.forward(F.silu(x))
         
         y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param , x)
-
         out = y * F.silu(v)     # (B , L , D)
         return out
     
 class Mamba(nn.Module):
-    def __init__(self , config: ModelConfig):
+    def __init__(self, d_model: int, n_states: int, n_layers: int, conv_kernel_size: int):
         super().__init__()
-
-        self.embed = nn.Embedding(config.vocab_size , config.d_model)
-        self.output_proj = nn.Linear(config.d_model , config.vocab_size)
-        self.output_proj.weight = self.embed.weight
-
-        nn.init.normal_(self.output_proj.weight, 0, 0.02)
 
         _layers: list[MambaBlock] = []
         _rms_norms: list[nn.RMSNorm] = []
-        for _ in range(config.n_layers):
-            _layers.append(MambaBlock(config))
-            _rms_norms.append(nn.RMSNorm(config.d_model))
+        for _ in range(n_layers):
+            _rms_norms.append(nn.RMSNorm(d_model))
+            _layers.append(MambaBlock(d_model, n_states, conv_kernel_size))
         self._layers = _layers
         self.layers = nn.ModuleList(_layers)
         self.rms_norms = nn.ModuleList(_rms_norms)
 
-    def forward(self , ids: torch.Tensor):
-        emb = self.embed.forward(ids)
-
+    def forward(self , x: torch.Tensor):
         for i in range(len(self.layers)):
-            emb = self.rms_norms[i].forward(self.layers[i].forward(emb) + emb)
-        
-        logit = self.output_proj.forward(emb)
-        return logit
+            x = self.rms_norms[i](x)
+            x = self.layers[i].forward(x) + x
+        return x
