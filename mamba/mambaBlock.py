@@ -43,7 +43,7 @@ class MambaBlock(nn.Module):
         delta = delta * F.sigmoid(delta)
         A = -torch.exp(self.A_log_param)
         B = (B + self.B_param[None , None , :])
-        x = self.conv.forward(F.silu(x))
+        x = F.silu(self.conv.forward(x))
         
         y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param , x)
         out = y * F.silu(v)     # (B , L , D)
