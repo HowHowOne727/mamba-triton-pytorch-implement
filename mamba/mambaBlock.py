@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ssm_kernel import mamba_fusion_ssm
+from .ssm_kernel import mamba_fusion_ssm
 
 
 class CausalConv1d(nn.Module):
@@ -16,48 +16,62 @@ class CausalConv1d(nn.Module):
         return x.contiguous()
 
 class MambaBlock(nn.Module):
-    def __init__(self, d_model: int, n_states: int, conv_kernel_size: int):
+    def __init__(self, d_model: int, expansion_factor: float, n_states: int, dt_rank: int, conv_kernel_size: int):
         super().__init__()
         self.d_model = d_model
+        self.d_inner = int(d_model * expansion_factor)
         self.n_states = n_states
+        self.dt_rank = dt_rank
         self.conv_kernel_size = conv_kernel_size
 
-        self.in_proj = nn.Linear(self.d_model , (self.d_model + self.d_model + self.n_states + 1))   # n_states for B, 1 for delta
+        self.in_proj = nn.Linear(self.d_model , (self.d_inner + self.d_inner + self.n_states + self.dt_rank))   # n_states for B, 1 for delta
         
-        A_init = torch.arange(1 , self.n_states + 1 , 1 , dtype=torch.float32).repeat(self.d_model , 1).contiguous()
+        A_init = torch.arange(1 , self.n_states + 1 , 1 , dtype=torch.float32).repeat(self.d_inner , 1).contiguous()
         self.A_log_param = nn.Parameter(torch.log(A_init))
         self.B_param = nn.Parameter(torch.randn(self.n_states) / self.n_states**0.5)    # (N)
-        self.C_param = nn.Parameter(torch.randn(self.d_model , self.n_states) / self.n_states**0.5)   # (D , N)
+        self.C_param = nn.Parameter(torch.randn(self.d_inner , self.n_states) / self.n_states**0.5)   # (D , N)
+        self.dt_rank_to_D = nn.Linear(self.dt_rank, self.d_inner)
 
-        self.conv = CausalConv1d(self.d_model , self.conv_kernel_size , self.d_model)
+        self.conv = CausalConv1d(self.d_inner , self.conv_kernel_size , self.d_model)
+
+        self.output_proj = nn.Linear(self.d_inner, self.d_model)
 
         nn.init.normal_(self.in_proj.weight, 0, 0.02)
+        nn.init.normal_(self.dt_rank_to_D.weight, 0, 0.02)
+        nn.init.normal_(self.output_proj.weight, 0, 0.02)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # input : (B , L , D)
         x_proj = self.in_proj.forward(input)
 
-        v , x , B , delta = torch.split(x_proj , [self.d_model , self.d_model , self.n_states , 1] , dim=-1)
+        v , x , B , delta = torch.split(x_proj , [self.d_inner , self.d_inner , self.n_states , self.dt_rank] , dim=-1)
 
-        delta = F.softplus(delta).squeeze(-1)  # (B , L , 1) to (B , L)
-        delta = delta * F.sigmoid(delta)
-        A = -torch.exp(self.A_log_param)
-        B = (B + self.B_param[None , None , :])
         x = F.silu(self.conv.forward(x))
-        
-        y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param , x)
-        out = y * F.silu(v)     # (B , L , D)
-        return out
+
+        with torch.autocast("cuda", enabled=False):
+            # cast float32
+            delta = delta.float()
+            x = x.float()
+            B = B.float()
+
+            delta = F.softplus(self.dt_rank_to_D.forward(delta))  # (B , L , dt_rank) -> (B , L , D)
+            A = -torch.exp(self.A_log_param.float())
+            B = (B + self.B_param.float()[None , None , :])
+            
+            y , h_out = mamba_fusion_ssm(delta , A , B , self.C_param.float() , x)
+            out = y * F.silu(v.float())     # (B , L , D)
+        out = out.to(v.dtype)
+        return self.output_proj(out)
     
 class Mamba(nn.Module):
-    def __init__(self, d_model: int, n_states: int, n_layers: int, conv_kernel_size: int):
+    def __init__(self, d_model: int, expansion_factor: float, n_states: int, dt_rank: int, n_layers: int, conv_kernel_size: int):
         super().__init__()
 
         _layers: list[MambaBlock] = []
         _rms_norms: list[nn.RMSNorm] = []
         for _ in range(n_layers):
             _rms_norms.append(nn.RMSNorm(d_model))
-            _layers.append(MambaBlock(d_model, n_states, conv_kernel_size))
+            _layers.append(MambaBlock(d_model, expansion_factor, n_states, dt_rank, conv_kernel_size))
         self._layers = _layers
         self.layers = nn.ModuleList(_layers)
         self.rms_norms = nn.ModuleList(_rms_norms)

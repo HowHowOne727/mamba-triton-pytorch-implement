@@ -4,6 +4,7 @@ import zstandard as zstd
 import array
 import random
 from typing import Callable, Iterable
+import torch
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 
@@ -163,16 +164,32 @@ class StringDataFile:
 
 
 class wordDataset(Dataset):
-    def __init__(self, file_path: str, tokenizer_path: str):
+    def __init__(self, datafile_path: str, tokenizer_path: str, read_len: int, pad_tok: int, sep_tok: int) -> None:
         super().__init__()
-        self.datafile = StringDataFile(file_path)
+        self.tokenizer_path = tokenizer_path
+        self.datafile_path = datafile_path
+        self.pad_tok = pad_tok
+        self.sep_tok = sep_tok
+        self.read_len = read_len
+        self.datafile = None
+        self.tokenizer = None
 
-        self.tokenizer: Tokenizer = Tokenizer.from_file(tokenizer_path)
+        _datafile = StringDataFile(datafile_path)
+        self.length = len(_datafile)
 
     def __len__(self):
-        return len(self.datafile)
-    def __getitem__(self, index):
-        return self.datafile[index]
+        return self.length
+    def __getitem__(self, index) -> torch.Tensor:
+        if self.tokenizer is None:
+            self.tokenizer = Tokenizer.from_file(self.tokenizer_path)
+        if self.datafile is None:
+            self.datafile = StringDataFile(self.datafile_path)
+        
+        ids = []
+        while len(ids) < self.read_len:
+            ids.extend(self.tokenizer.encode(self.datafile[index]).ids + [self.sep_tok])
+            index += 1
+        return torch.tensor(ids[:self.read_len], dtype=torch.long)
 
 def train_tokenizer(
         datafile_path: str,
