@@ -3,10 +3,15 @@ import triton
 import triton.language as tl
 
 
+# set your config here
+CHECKPOINT = 32
+FORWARD_BLOCK_SIZE_D = 32
+BACKWARD_BLOCK_SIZE_D = 8
+
 @triton.jit
 def mamba_fusion_ssm_kernel(
         delta, A, B, C, x, y, h, h_out,   # ptrs
-        Batch_size, length, d_model, checkpoint,   # ints
+        Batch_size, length, d_model,   # ints
         delta_stride_B, delta_stride_L, delta_stride_D,
         A_stride_D, A_stride_N,
         B_stride_B, B_stride_L, B_stride_N,
@@ -15,7 +20,7 @@ def mamba_fusion_ssm_kernel(
         y_stride_B, y_stride_L, y_stride_D,
         h_stride_B, h_stride_L, h_stride_D, h_stride_N,
         h_out_stride_B, h_out_stride_D, h_out_stride_N,
-        BLOCK_SIZE_D: tl.constexpr, n_state: tl.constexpr
+        BLOCK_SIZE_D: tl.constexpr, n_state: tl.constexpr, checkpoint: tl.constexpr
 ):
     """
     mamba_fusion_ssm_kernel 的 Docstring
@@ -85,7 +90,7 @@ def mamba_fusion_ssm_kernel(
 
         hidden_tile = hidden_next
 
-        if (steps + 1) % checkpoint == 0:   # save checkpoint
+        if (steps + 1) % checkpoint == 0:   # type: ignore # save checkpoint
             tl.store(h_ptr + h_stride_L * ((steps + 1)//checkpoint) , hidden_tile[: , None , : , :])
 
         _out = tl.sum(hidden_tile * C_tile[None , : , :] , axis=-1)   # (B , D)
@@ -239,11 +244,13 @@ def mamba_fusion_ssm(
         C: torch.Tensor,
         x: torch.Tensor,
         h0: torch.Tensor|None = None,
-        checkpoint_len: int = 128
-):
+        checkpoint_len: int = 32,
+        forward_block_size_d: int = FORWARD_BLOCK_SIZE_D,
+        backward_block_size_d: int = BACKWARD_BLOCK_SIZE_D
+) -> tuple[torch.Tensor, torch.Tensor]:
     if h0 is None:
         h0 = torch.zeros(size=(x.size(0) , x.size(-1) , A.size(-1)) , dtype=x.dtype , device=x.device)
-    y, h_out = MambaFusionSSMFunction.apply(delta , A , B , C , x , h0 , checkpoint_len) # type: ignore
+    y, h_out = MambaFusionSSMFunction.apply(delta , A , B , C , x , h0 , checkpoint_len, forward_block_size_d, backward_block_size_d) # type: ignore
     return y, h_out
 
 class MambaFusionSSMFunction(torch.autograd.Function):
@@ -256,9 +263,11 @@ class MambaFusionSSMFunction(torch.autograd.Function):
         C: torch.Tensor,
         x: torch.Tensor,
         h0: torch.Tensor,
-        checkpoint_len:int
+        checkpoint_len:int,
+        forward_block_size_d: int,
+        backward_block_size_d: int
     ):
-        BLOCK_SIZE_D = 32
+        BLOCK_SIZE_D = forward_block_size_d
         Batch_size , Length , D_model = x.shape
         n_state = A.size(-1)
 
@@ -266,6 +275,7 @@ class MambaFusionSSMFunction(torch.autograd.Function):
         h_checkpoint[: , 0 , : , :] = h0
 
         ctx.checkpoint_len = checkpoint_len
+        ctx.backward_block_size_d = backward_block_size_d
         ctx.save_for_backward(delta , A , B , C , x , h_checkpoint)
 
         y = torch.empty_like(x, device=x.device)
@@ -273,7 +283,7 @@ class MambaFusionSSMFunction(torch.autograd.Function):
 
         grid = (Batch_size , triton.cdiv(D_model , BLOCK_SIZE_D))
         mamba_fusion_ssm_kernel[grid](delta, A, B, C, x, y, h_checkpoint, h_out,
-                                    Batch_size, Length, D_model, checkpoint_len,
+                                    Batch_size, Length, D_model,
                                     delta.stride(0), delta.stride(1), delta.stride(2),
                                     A.stride(0) , A.stride(1),
                                     B.stride(0), B.stride(1), B.stride(2),
@@ -282,7 +292,7 @@ class MambaFusionSSMFunction(torch.autograd.Function):
                                     y.stride(0), y.stride(1), y.stride(2),
                                     h_checkpoint.stride(0), h_checkpoint.stride(1), h_checkpoint.stride(2), h_checkpoint.stride(3),
                                     h_out.stride(0), h_out.stride(1), h_out.stride(2),
-                                    BLOCK_SIZE_D, n_state) # type: ignore
+                                    BLOCK_SIZE_D, n_state, checkpoint_len) # type: ignore
 
         return y , h_out
     
@@ -297,7 +307,7 @@ class MambaFusionSSMFunction(torch.autograd.Function):
         x: torch.Tensor
         h_checkpoint: torch.Tensor
 
-        BLOCK_SIZE_D = 4
+        BLOCK_SIZE_D = ctx.backward_block_size_d
         Batch_size, Length, D_model = x.shape
         n_state = A.size(-1)
 
@@ -326,4 +336,4 @@ class MambaFusionSSMFunction(torch.autograd.Function):
             BLOCK_SIZE_D, n_state, checkpoint_len   # type: ignore
         )
 
-        return g_delta, g_A, g_B, g_C, g_x, g_h0, None
+        return g_delta, g_A, g_B, g_C, g_x, g_h0, None, None, None
