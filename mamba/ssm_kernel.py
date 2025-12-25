@@ -198,6 +198,7 @@ def mamba_fusion_ssm_backward_kernel(
                 B_hat = _expTempm1sA * (delta_tile * B_tile)              # (B , D , N)
 
                 g_C_tile += g_y_tile[: , : , None] * h_curr      # C gradient
+                g_h_tile += g_y_tile[: , : , None] * C_tile[None , : , :]
                 g_A_hat = g_h_tile * h_curr
                 g_B_hat = g_h_tile * x_tile[: , : , None]
 
@@ -211,7 +212,7 @@ def mamba_fusion_ssm_backward_kernel(
 
                 _g_x = g_h_tile * B_hat
 
-                g_h_tile = g_h_tile * A_hat + g_y_tile[: , : , None] * C_tile[None , : , :]  # h_t gradient, updata g_h_tile
+                g_h_tile = g_h_tile * A_hat     # h_t gradient, updata g_h_tile
 
                 tl.store(g_x_ptr + idx * x_stride_L , tl.sum(_g_x , axis=-1))               # save x gradient
                 tl.store(g_delta_ptr + idx * delta_stride_L ,tl.sum(_g_delta , axis=-1))    # save delta gradient
@@ -238,7 +239,7 @@ def mamba_fusion_ssm(
         C: torch.Tensor,
         x: torch.Tensor,
         h0: torch.Tensor|None = None,
-        checkpoint_len: int = 32
+        checkpoint_len: int = 128
 ):
     if h0 is None:
         h0 = torch.zeros(size=(x.size(0) , x.size(-1) , A.size(-1)) , dtype=x.dtype , device=x.device)
