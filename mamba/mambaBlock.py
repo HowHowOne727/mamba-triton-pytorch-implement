@@ -33,6 +33,9 @@ class MambaBlock(nn.Module):
         self.C_param = nn.Parameter(torch.randn(self.d_inner , self.n_states) / self.n_states**0.5)   # (D , N)
         self.dt_rank_to_D = nn.Linear(self.dt_rank, self.d_inner)
 
+        _dt_vals = torch.exp(torch.rand(self.d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
+        self.dt_rank_to_D.bias = nn.Parameter(torch.log(torch.exp(_dt_vals) - 1))
+
         self.conv = CausalConv1d(self.d_inner , self.conv_kernel_size , self.d_inner)
 
         self.output_proj = nn.Linear(self.d_inner, self.d_model)
@@ -40,7 +43,7 @@ class MambaBlock(nn.Module):
         nn.init.normal_(self.in_proj.weight, 0, 0.02)
         nn.init.normal_(self.dt_rank_to_D.weight, 0, 0.02)
         nn.init.normal_(self.output_proj.weight, 0, 0.02)
-        nn.init.zeros_(self.dt_rank_to_D.bias)
+        # nn.init.zeros_(self.dt_rank_to_D.bias)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         # input : (B , L , D)

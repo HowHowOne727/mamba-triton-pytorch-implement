@@ -28,7 +28,9 @@ def benchmark_mamba(L: int, D: int, N: int, configs: list[dict]):
 
         ms = triton.testing.do_bench(full_step)
         configs[i]['ms'] = ms
+        print(configs[i])
     
+    print("\n\n\nresult:")
     configs.sort(key=lambda c : c['ms'])
     for c in configs:
         print(c)
@@ -59,6 +61,6 @@ def make_config(checkpoints: list[int], forward_block_size_ds: list[int], backwa
     
 # example bench
 if __name__ == "__main__":
-    configs = make_config([16, 32, 64, 128], [8, 16, 32, 64], [2, 4, 8, 16, 32])
+    configs = make_config([16, 32, 64], [4, 8, 16, 32], [2, 4, 8, 16, 32])
     print(len(configs))
-    benchmark_mamba(1024, 1536, 16, configs)
+    benchmark_mamba(1024, 768, 16, configs)

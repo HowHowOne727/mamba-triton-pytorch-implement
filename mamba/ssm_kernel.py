@@ -4,8 +4,8 @@ import triton.language as tl
 
 
 # set your config here
-CHECKPOINT = 32
-FORWARD_BLOCK_SIZE_D = 32
+CHECKPOINT = 16
+FORWARD_BLOCK_SIZE_D = 16
 BACKWARD_BLOCK_SIZE_D = 8
 
 @triton.jit
@@ -38,70 +38,61 @@ def mamba_fusion_ssm_kernel(
     pid_D = tl.program_id(1)
 
     offs_B = pid_B + tl.arange(0 , 1)
+    offs_L = tl.arange(0, checkpoint)
     offs_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
     offs_N = tl.arange(0 , n_state)
 
     # load delta
-    delta_ptr = delta + (offs_B[: , None] * delta_stride_B + offs_D[None , :] * delta_stride_D)   # (B , D)
+    delta_ptr = delta + (offs_B[:, None, None] * delta_stride_B + offs_L[None, :, None] * delta_stride_L + offs_D[None, None, :] * delta_stride_D)   # (B, L, D)
 
     # load hidden
-    h0_ptr = h + (offs_B[: , None , None] * h_stride_B\
-                   + offs_D[None , : , None] * h_stride_D\
-                   + offs_N[None , None , :] * h_stride_N)
+    h0_ptr = h + (offs_B[:, None, None] * h_stride_B + offs_D[None, :, None] * h_stride_D + offs_N[None, None, :] * h_stride_N)   # (B, D, N)
+    h_cp_ptr = h + (offs_B[:, None, None] * h_stride_B + offs_D[None, :, None] * h_stride_D + offs_N[None, None, :] * h_stride_N)     # (B, D, N)
     
-    h_ptr = h + (offs_B[: , None , None , None] * h_stride_B\
-                   + offs_D[None , None , : , None] * h_stride_D\
-                   + offs_N[None , None , None , :] * h_stride_N)
-    
-    hidden_tile: tl.tensor = tl.load(h0_ptr)     # (B , D , N)
+    hidden_tile: tl.tensor = tl.load(h0_ptr)     # (B, D, N)
 
     # load A
     A_ptr = A + (offs_D[: , None] * A_stride_D + offs_N[None , :] * A_stride_N)
     A_tile: tl.tensor = tl.load(A_ptr)    # (D , N)
 
     # set B ptr
-    B_ptr = B + (offs_B[: , None] * B_stride_B + offs_N[None , :] * B_stride_N)   # (B , N)
+    B_ptr = B + (offs_B[:, None, None] * B_stride_B + offs_L[None, :, None] * B_stride_L + offs_N[None, None, :] * B_stride_N)   # (B, L, N)
 
     # load C
     C_ptr = C + (offs_D[: , None] * C_stride_D + offs_N[None , :] * C_stride_N)
     C_tile: tl.tensor = tl.load(C_ptr)    # (D , N)
 
-    # load x
-    x_ptr = x + (offs_B[: , None] * x_stride_B\
-                 + offs_D[ None , :] * x_stride_D)
-    
-    # y
-    offs_y_L = tl.arange(0 , 1)
+    # x and y
+    x_ptr = x + (offs_B[:, None, None] * x_stride_B + offs_L[None, :, None] * x_stride_L + offs_D[None, None, :] * x_stride_D)  # (B, L, D)
+    y_ptr = y + (offs_B[:, None, None] * y_stride_B + offs_L[None, :, None] * y_stride_L + offs_D[None, None, :] * y_stride_D)  # (B, L, D)
 
-    y_ptr = y + (offs_B[: , None , None] * y_stride_B\
-                 + offs_y_L[None , : , None] * y_stride_L\
-                 + offs_D[None , None , :] * y_stride_D)
+    for steps in range(0, length, checkpoint):     # main loop
+        mask_L = offs_L + steps < length
 
-    for steps in range(0, length):     # main loop
-        x_tile: tl.tensor = tl.load(x_ptr + steps * x_stride_L)             # (B , D)
-        delta_t: tl.tensor = tl.load(delta_ptr + steps * delta_stride_L)[: , : , None]    # (B, D) -> (B, D, N)
-        B_tile = tl.load(B_ptr + steps * B_stride_L)[: , None , :]          # (B , N) -> (B , D , N)
+        # chunked loads
+        x_tile = tl.load(x_ptr + steps * x_stride_L, mask=mask_L[None, :, None])              # (B, L, D)
+        delta_tile = tl.load(delta_ptr + steps * delta_stride_L, mask=mask_L[None, :, None])[:, :, :, None]     # (B, L, D) -> (B, L, D, N)
+        B_tile = tl.load(B_ptr + steps * B_stride_L, mask=mask_L[None, :, None])[:, :, None, :]          # (B, L, N) -> (B, L, D, N)
 
-        temp = delta_t * A_tile[None , : , :]   # (B , D , N)
-        A_hat = tl.exp(temp)     # (B , D , N)
-        B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_t * B_tile)  # (B , D , N)
+        _out = tl.zeros_like(x_tile)    # (B, L, D)
 
-        hidden_next = A_hat * hidden_tile + B_hat * x_tile[: , : , None]
+        if steps > 0:   # save hidden checkpoint
+            tl.store(h_cp_ptr + (steps//checkpoint) * h_stride_L, hidden_tile)
 
-        hidden_tile = hidden_next
+        A_hat = tl.exp(delta_tile * A_tile[None, None, :, :])     # (B, L, D, N)
+        B_hat = delta_tile * B_tile * x_tile[:, :, :, None]     # (B, L, D, N)
 
-        if (steps + 1) % checkpoint == 0:   # type: ignore # save checkpoint
-            tl.store(h_ptr + h_stride_L * ((steps + 1)//checkpoint) , hidden_tile[: , None , : , :])
+        for i in range(checkpoint):
+            A_hat_t = tl.sum(tl.where(((offs_L == i) & mask_L)[None, :, None, None], A_hat, 0.0), axis=1)    # (B, D, N)
+            B_hat_t = tl.sum(tl.where(((offs_L == i) & mask_L)[None, :, None, None], B_hat, 0.0), axis=1)    # (B, D, N)
+            hidden_tile = A_hat_t * hidden_tile + B_hat_t
 
-        _out = tl.sum(hidden_tile * C_tile[None , : , :] , axis=-1)   # (B , D)
+            _out = tl.where(offs_L[None, :, None] == i, tl.sum(hidden_tile * C_tile[None, :, :], axis=-1)[:, None, :], _out)
 
-        tl.store(y_ptr + steps * y_stride_L , _out[: , None , :])
+        tl.store(y_ptr + steps * y_stride_L , _out, mask=mask_L[None, :, None])
 
     # save h_out
-
-    h_out_ptr = h_out + (offs_B[: , None , None] * h_out_stride_B\
-                         + offs_D[None , : , None] * h_out_stride_D\
-                         + offs_N[None , None , :] * h_out_stride_N)
+    h_out_ptr = h_out + (offs_B[:, None, None] * h_out_stride_B + offs_D[None, :, None] * h_out_stride_D + offs_N[None, None, :] * h_out_stride_N)
     tl.store(h_out_ptr , hidden_tile)
 
 @triton.jit
@@ -128,15 +119,16 @@ def mamba_fusion_ssm_backward_kernel(
     pid_D = tl.program_id(1)
 
     offs_B = pid_B + tl.arange(0 , 1)
+    offs_L = tl.arange(0, checkpoints)
     offs_D = pid_D * BLOCK_SIZE_D + tl.arange(0 , BLOCK_SIZE_D)
     offs_N = tl.arange(0 , n_states)
 
     # load A, C
-    A_ptr = A + (offs_D[: , None] * A_stride_D + offs_N[None , :] * A_stride_N)
-    C_ptr = C + (offs_D[: , None] * C_stride_D + offs_N[None , :] * C_stride_N)
+    A_ptr = A + (offs_D[:, None] * A_stride_D + offs_N[None, :] * A_stride_N)
+    C_ptr = C + (offs_D[:, None] * C_stride_D + offs_N[None, :] * C_stride_N)
 
-    B_ptr = B + (offs_B[: , None] * B_stride_B + offs_N[None , :] * B_stride_N)    # (B , N)
-    g_B_ptr = g_B + (offs_B[: , None] * B_stride_B + offs_N[None , :] * B_stride_N)
+    B_ptr = B + (offs_B[:, None, None] * B_stride_B + offs_L[None, :, None] * B_stride_L + offs_N[None, None, :] * B_stride_N)    # (B, L, N)
+    g_B_ptr = g_B + (offs_B[:, None, None] * B_stride_B + offs_L[None, :, None] * B_stride_L + offs_N[None, None, :] * B_stride_N)
 
     A_tile = tl.load(A_ptr)
     C_tile = tl.load(C_ptr)
@@ -145,83 +137,63 @@ def mamba_fusion_ssm_backward_kernel(
     g_C_tile = tl.zeros_like(C_tile[None , : , :])
 
     # pre-calculate pointers
-    delta_ptr = delta + (offs_B[: , None] * delta_stride_B + offs_D[None , :] * delta_stride_D)     # (B, D)
-    g_delta_ptr = g_delta + (offs_B[: , None] * delta_stride_B + offs_D[None , :] * delta_stride_D)
+    delta_ptr = delta + (offs_B[:, None, None] * delta_stride_B + offs_L[None, :, None] * delta_stride_L + offs_D[None, None, :] * delta_stride_D)     # (B, L, D)
+    g_delta_ptr = g_delta + (offs_B[:, None, None] * delta_stride_B + offs_L[None, :, None] * delta_stride_L + offs_D[None, None, :] * delta_stride_D)
 
-    x_ptr = x + (offs_B[: , None] * x_stride_B + offs_D[None , :] * x_stride_D)     # (B , D)
-    g_x_ptr = g_x + (offs_B[: , None] * x_stride_B + offs_D[None , :] * x_stride_D)
+    x_ptr = x + (offs_B[:, None, None] * x_stride_B + offs_L[None, :, None] * x_stride_L + offs_D[None, None, :] * x_stride_D)     # (B, L, D)
+    g_x_ptr = g_x + (offs_B[:, None, None] * x_stride_B + offs_L[None, :, None] * x_stride_L + offs_D[None, None, :] * x_stride_D)
 
-    h_cp_ptr = h_cp + (offs_B[: , None , None] * h_cp_stride_B + offs_D[None , : , None] * h_cp_stride_D + offs_N[None , None , :] * h_cp_stride_N)     # (B , D , N)
+    h_cp_ptr = h_cp + (offs_B[: , None , None] * h_cp_stride_B + offs_D[None , : , None] * h_cp_stride_D + offs_N[None , None , :] * h_cp_stride_N)     # (B, D, N)
 
-    g_y_ptr = g_y + (offs_B[: , None] * g_y_stride_B + offs_D[None , :] * g_y_stride_D)
+    g_y_ptr = g_y + (offs_B[:, None, None] * g_y_stride_B + offs_L[None, :, None] * g_y_stride_L + offs_D[None , None , :] * g_y_stride_D)      # (B, L, D)
 
     # load g_h_out
-    g_h_out_ptr = g_h_out + (offs_B[: , None , None] * g_h_out_stride_B + offs_D[None , : , None] * g_h_out_stride_D + offs_N[None , None , :] * g_h_out_stride_N)  # (B , D , N)
+    g_h_out_ptr = g_h_out + (offs_B[: , None , None] * g_h_out_stride_B + offs_D[None , : , None] * g_h_out_stride_D + offs_N[None , None , :] * g_h_out_stride_N)  # (B, D, N)
     g_h_tile = tl.load(g_h_out_ptr)     # initialize with the last one
 
     for block_id in range((Length // checkpoints) , -1 , -1):
-        # create h_block
-        h_block = tl.zeros((1 , checkpoints , BLOCK_SIZE_D , n_states) , dtype=tl.float32)      # (B , L(checkpoint) , D , N)
-        h_block_arange_dim = tl.arange(0 , checkpoints)[None , : , None , None]
-        
-        hidden_curr = tl.load(h_cp_ptr + h_cp_stride_L * block_id)
-        h_block = tl.where(h_block_arange_dim == 0, hidden_curr[: , None , : , :], h_block)  # load and store hidden checkpoint to first
+        mask_L = offs_L + block_id * checkpoints < Length
+        # loads
+        x_tile = tl.load(x_ptr + block_id * checkpoints * x_stride_L, mask=mask_L[None, :, None])   # (B, L, D)
+        delta_tile = tl.load(delta_ptr + block_id * checkpoints * delta_stride_L, mask=mask_L[None, :, None])[:, :, :, None]   # (B, L, D) -> (B, L, D, N)
+        B_tile = tl.load(B_ptr + block_id * checkpoints * B_stride_L, mask=mask_L[None, :, None])[:, :, None, :]   # (B, L, N) -> (B, L, D, N)
+        hidden_curr = tl.load(h_cp_ptr + block_id * h_cp_stride_L)  # (B, D, N)
+        g_y_tile = tl.load(g_y_ptr + block_id * checkpoints * g_y_stride_L, mask=mask_L[None, :, None])        # (B, L, D)
+
+        A_hat = tl.exp(delta_tile * A_tile[None, None, :, :])    # (B, L, D, N)
+        A_hat = tl.where(mask_L[None, :, None, None], A_hat, 1.0)
+        B_hat = delta_tile * B_tile * x_tile[:, :, :, None]
+
+        hidden_all = tl.zeros_like(A_hat)   # (B, L, D, N)
+        hidden_all = tl.where(offs_L[None, :, None, None] == 0, hidden_curr[:, None, :, :], hidden_all) # set first to checkpoint hidden
 
         # forward for h_block
-        for i in range(checkpoints - 1):
-            idx = i + block_id * checkpoints
-            if (idx < Length):     # range check
-                # load x, delta, B
-                x_tile: tl.tensor = tl.load(x_ptr + idx * x_stride_L)  # (B , D)
-                delta_tile: tl.tensor = tl.load(delta_ptr + idx * delta_stride_L)[: , : , None]  # (B, D) -> (B , D , N)
-                B_tile = tl.load(B_ptr + idx * B_stride_L)[: , None , :]      # (B , N) -> (B , D , N)
+        for i in range(checkpoints):
+            A_hat_t = tl.sum(tl.where(((offs_L == i) & mask_L)[None, :, None, None], A_hat, 0.0), axis=1)    # (B, D, N)
+            B_hat_t = tl.sum(tl.where(((offs_L == i) & mask_L)[None, :, None, None], B_hat, 0.0), axis=1)    # (B, D, N)
+            hidden_curr = A_hat_t * hidden_curr + B_hat_t
 
-                temp = delta_tile * A_tile[None , : , :]  # (B , D , N)
-                A_hat = tl.exp(temp)    # (B , D , N)
-                B_hat = (A_hat - 1.0) / A_tile[None , : , :] * (delta_tile * B_tile)   # (B , D , N)
+            g_C_tile += tl.sum(tl.where(offs_L[None, :, None] == i, g_y_tile, 0.0), axis=1)[:, :, None] * hidden_curr   # compute C gradient here
 
-                hidden_curr = A_hat * hidden_curr + B_hat * x_tile[: , : , None]
-
-                h_block = tl.where(h_block_arange_dim == (i + 1) , hidden_curr[: , None , : , :] , h_block)   # write recomputed hidden to SRAM
+            hidden_all = tl.where(offs_L[None, :, None, None] == (i + 1) , hidden_curr[: , None , : , :] , hidden_all)   # write recomputed hidden to SRAM
         
         # backward
-        for i in range(checkpoints - 1 , -1 , -1):
-            idx = i + block_id * checkpoints
-            if (idx < Length):     # range check
-                _mask = h_block_arange_dim == i
-                h_curr = tl.sum(tl.where(_mask , h_block , 0.0) , axis=1)
+        g_hidden_all = g_y_tile[:, :, :, None] * C_tile[None, None, :, :]
 
-                # loads
-                g_y_tile = tl.load(g_y_ptr + idx * g_y_stride_L)                        # (B , D)
-                x_tile = tl.load(x_ptr + idx * x_stride_L)                              # (B , D)
-                delta_tile = tl.load(delta_ptr + idx * delta_stride_L)[: , : , None] # (B, D) -> (B , D , 1)
-                B_tile = tl.load(B_ptr + idx * B_stride_L)[: , None , :]                # (B , N) -> (B , D , N)
-                
-                temp = delta_tile * A_tile[None , : , :]                  # (B , D , N)   # delta*A
-                A_hat = tl.exp(temp)    # (B , D , N)
-                _expTempm1sA = (A_hat - 1.0) / A_tile[None , : , :]
-                B_hat = _expTempm1sA * (delta_tile * B_tile)              # (B , D , N)
+        for i in range(checkpoints - 1 , -1 , -1):  # reverse loop for calculate hidden gradient
+            g_h_tile += tl.sum(tl.where(offs_L[None, :, None, None] == i, g_hidden_all, 0.0), axis=1)
+            g_hidden_all = tl.where(offs_L[None, :, None, None] == i, g_h_tile[:, None, :, :], g_hidden_all)
+            g_h_tile *= tl.sum(tl.where(offs_L[None, :, None, None] == i, A_hat, 0.0), axis=1)
 
-                g_C_tile += g_y_tile[: , : , None] * h_curr      # C gradient
-                g_h_tile += g_y_tile[: , : , None] * C_tile[None , : , :]
-                g_A_hat = g_h_tile * h_curr
-                g_B_hat = g_h_tile * x_tile[: , : , None]
+        g_delta_tile = tl.sum(g_hidden_all * (hidden_all * A_hat * A_tile[None, None, :, :] + B_tile * x_tile[:, :, :, None]), axis=-1)
+        g_A_tile += tl.sum(g_hidden_all * A_hat * delta_tile, axis=1)
+        g_B_tile = tl.sum(g_hidden_all * delta_tile * x_tile[:, :, :, None], axis=2)    # (B, L, D, N)
+        g_x_tile = tl.sum(g_hidden_all * delta_tile * B_tile, axis=-1)                   # (B, L, D, N)
 
-                _g_temp = g_A_hat * A_hat
-                _g_temp += g_B_hat * A_hat / A_tile[None , : , :] * delta_tile * B_tile      # dB_hat * exp(temp)/A * delta * B
-                g_A_tile += g_B_hat * (-(tl.exp(temp) - 1) * delta_tile * B_tile / (A_tile[None , : , :]*A_tile[None , : , :]))  # dA = dB_hat * (-(exp(temp)-1)*delta*B / A^2)
-                _g_delta = g_B_hat * _expTempm1sA * B_tile
-                g_B_tile = g_B_hat * _expTempm1sA * delta_tile   # dB = dB_hat * (exp(temp) - 1) / A * delta
-                _g_delta += _g_temp * A_tile[None , : , :]
-                g_A_tile += _g_temp * delta_tile
-
-                _g_x = g_h_tile * B_hat
-
-                g_h_tile = g_h_tile * A_hat     # h_t gradient, updata g_h_tile
-
-                tl.store(g_x_ptr + idx * x_stride_L , tl.sum(_g_x , axis=-1))               # save x gradient
-                tl.store(g_delta_ptr + idx * delta_stride_L ,tl.sum(_g_delta , axis=-1))    # save delta gradient
-                tl.atomic_add(g_B_ptr + idx * B_stride_L, tl.sum(g_B_tile, axis=1, keep_dims=False))     # save B_t gradient
+        # stores
+        tl.store(g_delta_ptr + block_id * checkpoints * delta_stride_L, g_delta_tile, mask=mask_L[None, :, None])
+        tl.store(g_B_ptr + block_id * checkpoints * B_stride_L, g_B_tile, mask=mask_L[None, :, None])
+        tl.store(g_x_ptr + block_id * checkpoints * x_stride_L, g_x_tile, mask=mask_L[None, :, None])
     
     # save A, C, h0 gradient
     g_A_tile = tl.sum(g_A_tile , axis=0)    # (B , D , N) to (D , N)
@@ -244,7 +216,7 @@ def mamba_fusion_ssm(
         C: torch.Tensor,
         x: torch.Tensor,
         h0: torch.Tensor|None = None,
-        checkpoint_len: int = 32,
+        checkpoint_len: int = CHECKPOINT,
         forward_block_size_d: int = FORWARD_BLOCK_SIZE_D,
         backward_block_size_d: int = BACKWARD_BLOCK_SIZE_D
 ) -> tuple[torch.Tensor, torch.Tensor]:
