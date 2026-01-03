@@ -63,4 +63,4 @@ def make_config(checkpoints: list[int], forward_block_size_ds: list[int], backwa
 if __name__ == "__main__":
     configs = make_config([16, 32, 64], [4, 8, 16, 32], [2, 4, 8, 16, 32])
     print(len(configs))
-    benchmark_mamba(1024, 768, 16, configs)
+    benchmark_mamba(2048, 1024, 16, configs)

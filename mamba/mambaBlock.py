@@ -2,19 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .ssm_kernel import mamba_fusion_ssm
+from causalConv1d import CausalConv1d
 import math
 
-
-class CausalConv1d(nn.Module):
-    def __init__(self, d_model: int, kernel_size: int, num_group: int):
-        super().__init__()
-        self.kernel_size: int = kernel_size
-        self.conv = nn.Conv1d(d_model , d_model , kernel_size , 1 , kernel_size - 1 , groups=num_group , bias=False)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x : (B , L , D)
-        x = x.transpose(1 , 2)  # (B , D , L)
-        x = self.conv.forward(x)[: , : , :-(self.kernel_size-1)].transpose(1 , 2)   # (B , L , D)
-        return x.contiguous()
 
 class MambaBlock(nn.Module):
     def __init__(self, d_model: int, expansion_factor: float, n_states: int, dt_rank: int, conv_kernel_size: int):
@@ -36,7 +26,7 @@ class MambaBlock(nn.Module):
         _dt_vals = torch.exp(torch.rand(self.d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
         self.dt_rank_to_D.bias = nn.Parameter(torch.log(torch.exp(_dt_vals) - 1))
 
-        self.conv = CausalConv1d(self.d_inner , self.conv_kernel_size , self.d_inner)
+        self.conv = CausalConv1d(self.d_inner , self.conv_kernel_size)
 
         self.output_proj = nn.Linear(self.d_inner, self.d_model)
 

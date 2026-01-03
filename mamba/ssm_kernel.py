@@ -5,7 +5,7 @@ import triton.language as tl
 
 # set your config here
 CHECKPOINT = 16
-FORWARD_BLOCK_SIZE_D = 16
+FORWARD_BLOCK_SIZE_D = 8
 BACKWARD_BLOCK_SIZE_D = 8
 
 @triton.jit

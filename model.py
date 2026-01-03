@@ -24,7 +24,7 @@ class MambaModel(nn.Module):
         self.config = config
 
         self.embed = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.padding_idx)
-        self.output_proj = nn.Linear(config.d_model, config.vocab_size)
+        self.output_proj = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.output_proj.weight = self.embed.weight
         self.out_norm = nn.LayerNorm(config.d_model)
 
