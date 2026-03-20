@@ -22,11 +22,7 @@ def _mamba2_pytorch_fwd(A: Tensor, delta: Tensor, x: Tensor, B: Tensor, C: Tenso
 
 @triton.jit
 def softplus(x: tl.tensor) -> tl.tensor:
-    return tl.log(1 + tl.exp(x))
-
-@triton.jit
-def sigmoid(x: tl.tensor) -> tl.tensor:
-    return 1 / (1 + tl.exp(-x))
+    return tl.where(x > 10, x, tl.log(1 + tl.exp(x)))
 
 @triton.jit
 def _mamba2_fwd_kernel(
@@ -105,6 +101,7 @@ def _mamba2_fwd_kernel(
 
         # move ptrs
         A_ptrs += BLOCK_LEN * stride_A_T
+        delta_ptrs += BLOCK_LEN * stride_delta_T
         x_ptrs += BLOCK_LEN * stride_x_T
         y_ptrs += BLOCK_LEN * stride_y_T
         B_ptrs += BLOCK_LEN * stride_B_T
@@ -174,7 +171,8 @@ def _mamba2_bwd_kernel(
         A_log = tl.where(block_mask, A_log, 0)
         B = B_raw * delta[:, None]
         A_log_cumsum = tl.cumsum(A_log) # (C)
-        A_reversed_cumsum = tl.exp(tl.sum(A_log) - A_log_cumsum)
+        A_log_sum = tl.sum(A_log)
+        A_reversed_cumsum = tl.exp(A_log_sum - A_log_cumsum)
 
         # A_reversed_mask and A_mask
         A_reversed_mask = A_log_cumsum[None, :] - A_log_cumsum[:, None]
@@ -196,26 +194,26 @@ def _mamba2_bwd_kernel(
         dC_mask = tl.dot(dy, tl.trans(x, (1, 0))) * A_mask
         dC = tl.dot(dC_mask, B) + tl.dot(dy * tl.exp(A_log_cumsum)[:, None], tl.trans(h, (1, 0)))
 
-        # dA = dh_t * h_{t-1}
-        # dh for dA => \sum_{i = t}^{C}A_{i : t} C_i^\top dy_i + A_{C : t} dh_{end}
-        C_reduced = tl.sum(C, axis=1)   # (C)
-        dy_reduced = tl.sum(dy, axis=1) # (C)
-        dh_end_reduced = tl.sum(tl.sum(dh, axis=0), axis=0) # (1)
-        dh_for_dA = tl.sum(A_reversed_mask * C_reduced[None, :] * dy_reduced[None, :], axis=1)\
-                    + A_reversed_cumsum * dh_end_reduced    # (C)
-        # h_{t-1} for dA => \frac{\sum_{s = c}^{t} A_{t : s} B_s^\top x_s - A_{t:t} B_t^\top x_t+ A_{t: c-1} h_{c-1}}{A_t}
-        B_reduced = tl.sum(B, axis=1)   # (C)
-        x_reduced = tl.sum(x, axis=1)   # (C)
-        h_start_reduced = tl.sum(tl.sum(h, axis=0), axis=0) # (1)
-        h_for_dA = (tl.sum(A_mask * B_reduced[None, :] * x_reduced[None, :], axis=1)\
-                    - B_reduced * x_reduced\
-                    + tl.exp(A_log_cumsum) * h_start_reduced\
-                    ) / tl.exp(A_log)
-        dA = dh_for_dA * h_for_dA   # (C)
+        shift_matrix = tl.where(offs_T[:, None] == offs_T[None, :] + 1, 1.0, 0.0)
+        # dA
+        # intra chunk
+        dA_log_mask = tl.dot(C, tl.trans(B, (1, 0))) * tl.dot(dy, tl.trans(x, (1, 0))) * A_mask
+        col_sum = tl.sum(dA_log_mask, axis=0)
+        row_sum = tl.sum(dA_log_mask, axis=1)
+        dA_log = tl.sum(shift_matrix * tl.cumsum(col_sum - row_sum)[None, :], axis=1)
+        #dA_log = tl.cumsum(tl.sum(dA_log_mask, axis=0) - tl.sum(dA_log_mask, axis=1), reverse=True)
+        # h to dy
+        dA_log += tl.cumsum(tl.sum(tl.dot(dy, tl.trans(h, (1, 0))) * C * tl.exp(A_log_cumsum[:, None]), axis=1), reverse=True)
+        # h to dh
+        dA_log += tl.sum(h * dh) * tl.exp(A_log_sum)
+        # x to dh
+        dright_term_AB = tl.dot(x, tl.trans(dh, (1, 0)))    # (T, N)
+        dA_reversed_cumsum_cumsum = tl.cumsum(tl.sum(B * dright_term_AB * A_reversed_cumsum[:, None], axis=1))  # (C)
+        dA_log += tl.sum(shift_matrix * dA_reversed_cumsum_cumsum[None, :], axis=1)
 
         # final gradients calculation
-        dA_pure_raw = dA * tl.exp(A_log) * A_raw * delta    # (C)
-        ddelta_raw = (dA * tl.exp(A_log) * A_raw + tl.sum(dB * B_raw, axis=1)) * sigmoid(delta_raw)     # (C)
+        dA_pure_raw = dA_log * A_raw * delta    # (C)
+        ddelta_raw = (dA_log * A_raw + tl.sum(dB * B_raw, axis=1)) * tl.sigmoid(delta_raw)     # (C)
         dB_raw = dB * delta[:, None]    # (C, N)
 
         # update dh
@@ -303,8 +301,7 @@ class Mamba2Autograd(torch.autograd.Function):
             hiddens.stride(0), hiddens.stride(1), hiddens.stride(2), hiddens.stride(3), hiddens.stride(4),
             BLOCK_LEN, data_type # type: ignore
         )
-        hn = torch.zeros_like(h0)
-        hn += hiddens[:, -1, :, :, :]
+        hn = hiddens[:, -1, :, :, :].clone().to(h0.dtype).contiguous()
         return y, hn
 
     @staticmethod
